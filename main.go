@@ -13,12 +13,13 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"time"
 
 	prompt "github.com/c-bata/go-prompt"
 	"github.com/jedib0t/go-pretty/v6/table"
 	"github.com/jedib0t/go-pretty/v6/text"
 	"github.com/ktr0731/go-fuzzyfinder"
-	_ "github.com/mattn/go-sqlite3"
+	_ "modernc.org/sqlite"
 )
 
 const (
@@ -74,7 +75,8 @@ func main() {
 	dbPath := os.Args[1]
 
 	var err error
-	db, err = sql.Open("sqlite3", dbPath)
+	// Use the modified DSN
+	db, err = sql.Open("sqlite", dbPath)
 	if err != nil {
 		fmt.Printf("Failed to open database: %v\n", err)
 		os.Exit(1)
@@ -157,7 +159,11 @@ func executor(input string) {
 			fmt.Println("No rows found.")
 		}
 	} else {
-		printPrettyTable(rows)
+		err := printPrettyTable(rows)
+		if err != nil {
+			fmt.Printf("Error printing table: %v\n", err)
+			return
+		}
 	}
 }
 
@@ -313,6 +319,15 @@ func getColumnSuggestions(table string) []prompt.Suggest {
 	return suggestions
 }
 
+func formatTimePadded(t time.Time) string {
+	// Format the full second.
+	base := t.Format("2006-01-02 15:04:05")
+
+	// Extract microseconds (rounded).
+	usec := t.Nanosecond() / 1000
+	return fmt.Sprintf("%s.%06d", base, usec)
+}
+
 func formatValue(val interface{}) string {
 	switch v := val.(type) {
 	case nil:
@@ -320,6 +335,9 @@ func formatValue(val interface{}) string {
 
 	case []byte:
 		return `\x` + strings.ToUpper(hex.EncodeToString(v))
+
+	case time.Time:
+		return formatTimePadded(v)
 
 	default:
 		return fmt.Sprintf("%v", v)
@@ -331,12 +349,11 @@ func isNumeric(s string) bool {
 	return err == nil
 }
 
-func printPrettyTable(rows *sql.Rows) {
-	cols, _ := rows.Columns()
-	vals := make([]interface{}, len(cols))
-	valPtrs := make([]interface{}, len(cols))
-	for i := range vals {
-		valPtrs[i] = &vals[i]
+func printPrettyTable(rows *sql.Rows) error {
+	cols, err := rows.Columns()
+	if err != nil {
+		fmt.Printf("Failed to get columns: %v\n", err)
+		return err
 	}
 
 	t := table.NewWriter()
@@ -344,6 +361,12 @@ func printPrettyTable(rows *sql.Rows) {
 	t.SetStyle(psqlStyle)
 	t.Style().Format.Header = text.FormatLower
 	t.AppendHeader(toRow(cols))
+
+	vals := make([]interface{}, len(cols))
+	valPtrs := make([]interface{}, len(cols))
+	for i := range vals {
+		valPtrs[i] = &vals[i]
+	}
 
 	var sampleRow []string
 	var columnConfigs []table.ColumnConfig
@@ -385,6 +408,8 @@ func printPrettyTable(rows *sql.Rows) {
 	}
 
 	t.Render()
+
+	return nil
 }
 
 func printExpanded(rows *sql.Rows) (bool, error) {
