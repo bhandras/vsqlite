@@ -29,11 +29,11 @@ const (
 
 // Our table style.
 var psqlStyle = table.Style{
-	Name: "psql-style",
+	Name: "psql",
 	Box: table.BoxStyle{
-		BottomLeft:       "+",
-		BottomRight:      "+",
-		BottomSeparator:  "+",
+		BottomLeft:       "",
+		BottomRight:      "",
+		BottomSeparator:  "",
 		Left:             "|",
 		LeftSeparator:    "+",
 		MiddleHorizontal: "-",
@@ -43,17 +43,17 @@ var psqlStyle = table.Style{
 		PaddingRight:     " ",
 		Right:            "|",
 		RightSeparator:   "+",
-		TopLeft:          "+",
-		TopRight:         "+",
-		TopSeparator:     "+",
+		TopLeft:          "",
+		TopRight:         "",
+		TopSeparator:     "",
 		UnfinishedRow:    "…",
 	},
 	Color: table.ColorOptionsDefault,
 	Format: table.FormatOptions{
-		Header: text.FormatLower, // or text.FormatDefault
+		Header: text.FormatLower,
 	},
 	Options: table.Options{
-		DrawBorder:      true,
+		DrawBorder:      false,
 		SeparateColumns: true,
 		SeparateHeader:  true,
 		SeparateRows:    false,
@@ -75,7 +75,6 @@ func main() {
 	dbPath := os.Args[1]
 
 	var err error
-	// Use the modified DSN
 	db, err = sql.Open("sqlite", dbPath)
 	if err != nil {
 		fmt.Printf("Failed to open database: %v\n", err)
@@ -86,8 +85,14 @@ func main() {
 	historyFile = getHistoryFilePath()
 	loadHistory()
 
-	fmt.Println("Enter SQL statements. Type 'exit' to quit. Use '\\x' to " +
-		"toggle expanded mode.")
+	fmt.Println(
+		`Enter SQL statements. Built-in commands:
+		    \x         → toggle expanded display
+		    \d [table] → show table schema
+		    \d         → list all tables/views
+		    \di        → list all indexes
+		    CTRL+D     → quit`,
+	)
 
 	p := prompt.New(
 		executor,
@@ -134,6 +139,36 @@ func executor(input string) {
 		}
 
 		fmt.Printf("Expanded display is now %v\n", expandedModeStr)
+		return
+
+	case strings.HasPrefix(query, `\d `):
+		table := strings.TrimSuffix(
+			strings.TrimPrefix(query, `\d `), ";",
+		)
+
+		if table == "" {
+			fmt.Println("Usage: \\d <table>")
+			return
+		}
+
+		if err := printSchemaPretty(table); err != nil {
+			fmt.Printf("Schema error: %v\n", err)
+		}
+
+		return
+
+	case strings.TrimSpace(query) == `\d` || strings.TrimSpace(query) == `\d;`:
+		if err := printRelationList(); err != nil {
+			fmt.Printf("Error: %v\n", err)
+		}
+
+		return
+
+	case strings.TrimSpace(query) == `\di` || strings.TrimSpace(query) == `\di;`:
+		if err := printIndexList(); err != nil {
+			fmt.Printf("Error: %v\n", err)
+		}
+
 		return
 
 	case strings.HasPrefix(query, ".schema"):
@@ -195,12 +230,15 @@ func completer(d prompt.Document) []prompt.Suggest {
 
 	rules := []rule{
 		// .schema [table]
-
 		{
 			regexp.MustCompile(`(?i)^\.schema\s+(\w*)$`),
 			suggestTables(1),
 		},
-
+		// \d [table]
+		{
+			regexp.MustCompile(`(?i)^\\d\s+(\w+)$`),
+			suggestTables(1),
+		},
 		// table.column
 		{
 			regexp.MustCompile(`(?i)(\w+)\.(\w*)$`),
@@ -280,6 +318,173 @@ func handleSchemaCommand(query string) {
 	}
 }
 
+func printRelationList() error {
+	rows, err := db.Query(`
+		SELECT name, type
+		FROM sqlite_master
+		WHERE type IN ('table', 'view')
+		  AND name NOT LIKE 'sqlite_%'
+		ORDER BY type DESC, name;
+	`)
+	if err != nil {
+		return fmt.Errorf("failed to list relations: %w", err)
+	}
+	defer rows.Close()
+
+	fmt.Println("        List of relations")
+	fmt.Printf(" %-32s | %-6s\n", "Name", "Type")
+	fmt.Println(strings.Repeat("-", 41))
+
+	for rows.Next() {
+		var name, typ string
+		if err := rows.Scan(&name, &typ); err != nil {
+			return err
+		}
+		fmt.Printf(" %-32s | %-6s\n", name, typ)
+	}
+	return nil
+}
+
+func printIndexList() error {
+	rows, err := db.Query(`
+		SELECT name, tbl_name
+		FROM sqlite_master
+		WHERE type = 'index'
+		  AND name NOT LIKE 'sqlite_%'
+		ORDER BY tbl_name, name;
+	`)
+	if err != nil {
+		return fmt.Errorf("failed to list indexes: %w", err)
+	}
+	defer rows.Close()
+
+	t := table.NewWriter()
+	t.SetOutputMirror(os.Stdout)
+	t.SetStyle(psqlStyle)
+	t.AppendHeader(table.Row{"Index Name", "Table"})
+
+	for rows.Next() {
+		var name, tbl string
+		if err := rows.Scan(&name, &tbl); err != nil {
+			return err
+		}
+		t.AppendRow(table.Row{name, tbl})
+	}
+
+	t.Render()
+	return nil
+}
+
+func printSchemaPretty(tableName string) error {
+	fmt.Printf("\n📄 Table \"%s\"\n\n", tableName)
+
+	// Columns
+	colRows, err := db.Query(
+		fmt.Sprintf("PRAGMA table_info(%q)", tableName),
+	)
+	if err != nil {
+		return fmt.Errorf("PRAGMA table_info: %w", err)
+	}
+	defer colRows.Close()
+
+	t := table.NewWriter()
+	t.SetOutputMirror(os.Stdout)
+	t.SetStyle(psqlStyle)
+	t.AppendHeader(
+		table.Row{"Column", "Type", "Collation", "Nullable", "Default"},
+	)
+
+	for colRows.Next() {
+		var cid int
+		var name, ctype string
+		var notnull, pk int
+		var dflt sql.NullString
+		colRows.Scan(&cid, &name, &ctype, &notnull, &dflt, &pk)
+
+		nullable := "yes"
+		if notnull != 0 {
+			nullable = "no"
+		}
+		defaultVal := ""
+		if dflt.Valid {
+			defaultVal = dflt.String
+		}
+
+		t.AppendRow(table.Row{name, ctype, "", nullable, defaultVal})
+	}
+	t.Render()
+
+	// Indexes
+	idxRows, _ := db.Query(fmt.Sprintf("PRAGMA index_list(%q)", tableName))
+	defer idxRows.Close()
+
+	idxTable := table.NewWriter()
+	idxTable.SetOutputMirror(os.Stdout)
+	idxTable.SetStyle(psqlStyle)
+	idxTable.AppendHeader(table.Row{"Index Name", "Details"})
+
+	for idxRows.Next() {
+		var seq int
+		var name string
+		var unique int
+		var origin, partial string
+		idxRows.Scan(&seq, &name, &unique, &origin, &partial)
+
+		cols := []string{}
+		colInfo, _ := db.Query(
+			fmt.Sprintf("PRAGMA index_info(%q)", name),
+		)
+		for colInfo.Next() {
+			var seqno, cid int
+			var cname string
+			colInfo.Scan(&seqno, &cid, &cname)
+			cols = append(cols, cname)
+		}
+		colInfo.Close()
+
+		desc := ""
+		if origin == "pk" {
+			desc += "PRIMARY KEY"
+		} else if origin == "u" {
+			desc += "UNIQUE CONSTRAINT"
+		}
+		desc += fmt.Sprintf(" (btree: %s)", strings.Join(cols, ", "))
+		idxTable.AppendRow(table.Row{name, desc})
+	}
+	if idxTable.Length() > 0 {
+		fmt.Println("\n🔖 Indexes")
+		idxTable.Render()
+	}
+
+	// Foreign keys
+	fkRows, _ := db.Query(
+		fmt.Sprintf("PRAGMA foreign_key_list(%q)", tableName),
+	)
+	defer fkRows.Close()
+
+	fkTable := table.NewWriter()
+	fkTable.SetOutputMirror(os.Stdout)
+	fkTable.SetStyle(psqlStyle)
+	fkTable.AppendHeader(table.Row{"From", "To Table", "To Column"})
+
+	for fkRows.Next() {
+		var id, seq int
+		var refTable, from, to, onUpdate, onDelete, match string
+		fkRows.Scan(
+			&id, &seq, &refTable, &from, &to, &onUpdate,
+			&onDelete, &match,
+		)
+		fkTable.AppendRow(table.Row{from, refTable, to})
+	}
+	if fkTable.Length() > 0 {
+		fmt.Println("\n🔗 Foreign Keys")
+		fkTable.Render()
+	}
+
+	fmt.Println()
+	return nil
+}
+
 func getTableSuggestions() []prompt.Suggest {
 	rows, _ := db.Query(`SELECT name FROM sqlite_master
 		             WHERE type='table' AND name NOT LIKE 'sqlite_%'`)
@@ -294,6 +499,7 @@ func getTableSuggestions() []prompt.Suggest {
 			prompt.Suggest{Text: name, Description: "table"},
 		)
 	}
+
 	return suggestions
 }
 
