@@ -415,7 +415,10 @@ func printSchemaPretty(tableName string) error {
 	t.Render()
 
 	// Indexes
-	idxRows, _ := db.Query(fmt.Sprintf("PRAGMA index_list(%q)", tableName))
+	idxRows, err := db.Query(fmt.Sprintf("PRAGMA index_list(%q)", tableName))
+	if err != nil {
+		return err
+	}
 	defer idxRows.Close()
 
 	idxTable := table.NewWriter()
@@ -431,9 +434,13 @@ func printSchemaPretty(tableName string) error {
 		idxRows.Scan(&seq, &name, &unique, &origin, &partial)
 
 		cols := []string{}
-		colInfo, _ := db.Query(
+		colInfo, err := db.Query(
 			fmt.Sprintf("PRAGMA index_info(%q)", name),
 		)
+		if err != nil {
+			return err
+		}
+
 		for colInfo.Next() {
 			var seqno, cid int
 			var cname string
@@ -457,10 +464,14 @@ func printSchemaPretty(tableName string) error {
 	}
 
 	// Foreign keys
-	fkRows, _ := db.Query(
+	fkRows, err := db.Query(
 		fmt.Sprintf("PRAGMA foreign_key_list(%q)", tableName),
 	)
 	defer fkRows.Close()
+
+	if err != nil {
+		return err
+	}
 
 	fkTable := table.NewWriter()
 	fkTable.SetOutputMirror(os.Stdout)
@@ -486,8 +497,12 @@ func printSchemaPretty(tableName string) error {
 }
 
 func getTableSuggestions() []prompt.Suggest {
-	rows, _ := db.Query(`SELECT name FROM sqlite_master
+	rows, err := db.Query(`SELECT name FROM sqlite_master
 		             WHERE type='table' AND name NOT LIKE 'sqlite_%'`)
+	if err != nil {
+		return nil
+	}
+
 	defer rows.Close()
 
 	var suggestions []prompt.Suggest
