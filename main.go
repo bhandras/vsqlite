@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"database/sql"
 	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"math"
 	"os"
@@ -63,6 +64,7 @@ var psqlStyle = table.Style{
 var (
 	db           *sql.DB
 	expandedMode bool
+	jsonMode     bool
 	historyFile  string
 	historyLines []string
 )
@@ -88,6 +90,7 @@ func main() {
 	fmt.Println(
 		`Enter SQL statements. Built-in commands:
 		    \x         → toggle expanded display
+		    \j         → toggle JSON output
 		    \d [table] → show table schema
 		    \d         → list all tables/views
 		    \di        → list all indexes
@@ -118,6 +121,13 @@ func main() {
 	saveHistory()
 }
 
+func onOff(b bool) string {
+	if b {
+		return "on"
+	}
+	return "off"
+}
+
 func executor(input string) {
 	// Make sure that we don't execute empty queries.
 	query := strings.TrimSpace(input)
@@ -133,12 +143,20 @@ func executor(input string) {
 
 	case query == `\x`:
 		expandedMode = !expandedMode
-		expandedModeStr := "off"
 		if expandedMode {
-			expandedModeStr = "on"
+			jsonMode = false
 		}
+		fmt.Printf("Expanded display is now %s\n", onOff(expandedMode))
 
-		fmt.Printf("Expanded display is now %v\n", expandedModeStr)
+		return
+
+	case query == `\j`:
+		jsonMode = !jsonMode
+		if jsonMode {
+			expandedMode = false
+		}
+		fmt.Printf("JSON output is now %s\n", onOff(jsonMode))
+
 		return
 
 	case strings.HasPrefix(query, `\d `):
@@ -193,6 +211,11 @@ func executor(input string) {
 		if !hasRows {
 			fmt.Println("No rows found.")
 		}
+	} else if jsonMode {
+		if err := printJSON(rows); err != nil {
+			fmt.Printf("JSON output error: %v\n", err)
+		}
+		return
 	} else {
 		err := printPrettyTable(rows)
 		if err != nil {
@@ -633,6 +656,14 @@ func printPrettyTable(rows *sql.Rows) error {
 	return nil
 }
 
+func toRow(cols []string) table.Row {
+	row := make(table.Row, len(cols))
+	for i, col := range cols {
+		row[i] = col
+	}
+	return row
+}
+
 func printExpanded(rows *sql.Rows) (bool, error) {
 	cols, err := rows.Columns()
 	if err != nil {
@@ -692,12 +723,59 @@ func printExpanded(rows *sql.Rows) (bool, error) {
 	return true, nil
 }
 
-func toRow(cols []string) table.Row {
-	row := make(table.Row, len(cols))
-	for i, col := range cols {
-		row[i] = col
+func printJSON(rows *sql.Rows) error {
+	cols, err := rows.Columns()
+	if err != nil {
+		return err
 	}
-	return row
+
+	vals := make([]interface{}, len(cols))
+	valPtrs := make([]interface{}, len(cols))
+	for i := range vals {
+		valPtrs[i] = &vals[i]
+	}
+
+	var allRows []map[string]interface{}
+
+	for rows.Next() {
+		if err := rows.Scan(valPtrs...); err != nil {
+			return err
+		}
+
+		row := make(map[string]interface{})
+		for i, col := range cols {
+			raw := *(valPtrs[i].(*interface{}))
+			switch v := raw.(type) {
+			case []byte:
+				// Try to convert to string if printable,
+				// otherwise hex.
+				str := string(v)
+				if isPrintable(str) {
+					row[col] = str
+				} else {
+					row[col] = fmt.Sprintf(
+						"\\x%s", hex.EncodeToString(v),
+					)
+				}
+			default:
+				row[col] = raw
+			}
+		}
+		allRows = append(allRows, row)
+	}
+
+	enc := json.NewEncoder(os.Stdout)
+	enc.SetIndent("", "  ")
+	return enc.Encode(allRows)
+}
+
+func isPrintable(s string) bool {
+	for _, r := range s {
+		if r < 32 || r > 126 {
+			return false
+		}
+	}
+	return true
 }
 
 func getHistoryFilePath() string {
